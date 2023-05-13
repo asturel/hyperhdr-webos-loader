@@ -155,36 +155,60 @@ static bool power_callback(LSHandle* sh __attribute__((unused)), LSMessage* msg,
     JSchemaInfo schema;
     jvalue_ref parsed;
     service_t* service = (service_t*)data;
+
     INFO("Power status callback message: %s", LSMessageGetPayload(msg));
+
     jschema_info_init(&schema, jschema_all(), NULL, NULL);
     parsed = jdom_parse(j_cstr_to_buffer(LSMessageGetPayload(msg)), DOMOPT_NOOPT, &schema);
+
     // Parsing failed
     if (jis_null(parsed)) {
         j_release(&parsed);
         return true;
     }
+
     jvalue_ref state_ref = jobject_get(parsed, j_cstr_to_buffer("state"));
     if (!jis_valid(state_ref)) {
         DBG("power_callback: luna-reply does not contain 'state'");
         j_release(&parsed);
         return true;
     }
+
     raw_buffer state_buf = jstring_get(state_ref);
     const char* state_str = state_buf.m_str;
     bool processing = jobject_containskey(parsed, j_cstr_to_buffer("processing"));
     bool power_active = strcmp(state_str, "Active") == 0 && !processing;
-    bool power_active_standby = (strcmp(state_str, "Active Standby") == 0 || strcmp(state_str, "Power Off") == 0)/* && !processing*/;
+
+    bool power_active_standby = strcmp(state_str, "Active Standby") == 0 && !processing;
+    bool poweroff = strcmp(state_str, "Power Off") == 0;
+
     if (!is_running(service->daemon_pid) && power_active && service->power_paused) {
         INFO("Resuming service after power pause");
         service->power_paused = false;
+        service->power_suspended = false;
         daemon_start(service);
-    } else if (is_running(service->daemon_pid) && power_active_standby && !service->power_paused) {
+    } else if (is_running(service->daemon_pid) && (poweroff || power_active_standby) && !service->power_paused) {
         INFO("Shutting down service due to power event...");
         service->power_paused = true;
+        service->power_suspended = false;
         daemon_stop(service);
     }
+
+    if (!service->power_paused && is_running(service->daemon_pid)) {
+        if (power_active && service->power_suspended) {
+            INFO("Resuming service after suspend.");
+            service->power_suspended = false;
+            daemon_resume(service);
+        } else if (!power_active && !service->power_suspended) {
+            INFO("Suspending service due to power event...");
+            service->power_suspended = true;
+            daemon_pause(service);
+        }
+    }
+
     jstring_free_buffer(state_buf);
     j_release(&parsed);
+
     return true;
 }
 
